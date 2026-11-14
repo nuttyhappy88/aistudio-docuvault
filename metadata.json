@@ -1,0 +1,6 @@
+{
+  "name": "DocuVault",
+  "description": "Documents, workflows, chat and announcements for your businesses. Google sign-in with owner approval, records in Firestore, files in the company Google Drive. Installable as an app (PWA) and usable offline.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": []
+}

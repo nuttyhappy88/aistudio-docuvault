@@ -1,0 +1,165 @@
+rules_version = '2';
+// DocuVault security rules. Who may read and change what is decided here, not in the app.
+// Roles: superadmin (owner), bizadmin, manager, staff, viewer. People see only the businesses they are given.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function me() { return get(/databases/$(database)/documents/users/$(uid())).data; }
+    function hasProfile() { return signedIn() && exists(/databases/$(database)/documents/users/$(uid())); }
+    function approved() { return hasProfile() && me().status == 'approved' && me().active == true; }
+    function role() { return me().role; }
+    function isSuper() { return approved() && role() == 'superadmin'; }
+    function inBiz(b) { return approved() && (role() == 'superadmin' || (b != null && b in me().businesses)); }
+    function canEdit(b) { return inBiz(b) && role() in ['superadmin', 'bizadmin', 'manager', 'staff']; }
+    function isBizAdmin(b) { return inBiz(b) && role() in ['superadmin', 'bizadmin']; }
+    function canFile() { return approved() && role() in ['superadmin', 'bizadmin', 'manager', 'staff']; }
+    function onlyChanges(fields) { return request.resource.data.diff(resource.data).affectedKeys().hasOnly(fields); }
+
+    /* ---------- setup and settings ---------- */
+    match /config/owner {
+      allow get: if signedIn();
+      // The very first person to sign in becomes the owner.
+      allow create: if signedIn() && !exists(/databases/$(database)/documents/config/owner) && request.resource.data.uid == uid();
+      allow update, delete: if false;
+    }
+    match /config/{id} {
+      allow read: if approved();
+      allow write: if isSuper() && id != 'owner';
+    }
+
+    /* ---------- people ---------- */
+    match /users/{userId} {
+      allow get: if signedIn() && (userId == uid() || approved());
+      allow list: if isSuper() || (approved() && resource.data.status == 'approved');
+      allow create: if signedIn() && userId == uid() && request.resource.data.id == uid() && (
+        // asking to join: waits for the owner's approval
+        (request.resource.data.status == 'pending' && request.resource.data.role == 'viewer' && request.resource.data.businesses.size() == 0)
+        // invited by email: joins with what the owner chose
+        || (request.resource.data.status == 'approved'
+            && exists(/databases/$(database)/documents/invites/$(request.auth.token.email.lower()))
+            && request.resource.data.role == get(/databases/$(database)/documents/invites/$(request.auth.token.email.lower())).data.role
+            && request.resource.data.businesses == get(/databases/$(database)/documents/invites/$(request.auth.token.email.lower())).data.businesses)
+        // the owner, created together with config/owner
+        || (request.resource.data.status == 'approved' && request.resource.data.role == 'superadmin'
+            && getAfter(/databases/$(database)/documents/config/owner).data.uid == uid())
+      );
+      // Everyone may update their own name, photo, last sign-in and away settings; only the owner changes roles and access.
+      allow update: if isSuper() && !(userId == uid() && request.resource.data.role != 'superadmin')
+        || (signedIn() && userId == uid() && onlyChanges(['name', 'photo', 'lastLogin', 'awayUntil', 'backupId']));
+      allow delete: if isSuper() && userId != uid();
+    }
+    match /invites/{email} {
+      allow read, write: if isSuper();
+      allow get: if signedIn() && request.auth.token.email.lower() == email;
+    }
+
+    /* ---------- businesses and their content ---------- */
+    match /businesses/{bizId} {
+      allow read: if inBiz(bizId);
+      allow write: if isSuper();
+    }
+    match /folders/{id} {
+      allow read: if inBiz(resource.data.bizId);
+      allow create: if isBizAdmin(request.resource.data.bizId);
+      allow update: if isBizAdmin(resource.data.bizId) && request.resource.data.bizId == resource.data.bizId;
+      allow delete: if isBizAdmin(resource.data.bizId);
+    }
+    match /workflows/{id} {
+      allow read: if inBiz(resource.data.bizId);
+      allow create: if isBizAdmin(request.resource.data.bizId) && request.resource.data.steps.size() > 0;
+      allow update: if isBizAdmin(resource.data.bizId) && request.resource.data.bizId == resource.data.bizId;
+      allow delete: if isBizAdmin(resource.data.bizId);
+    }
+    match /docs/{id} {
+      allow read: if inBiz(resource.data.bizId);
+      allow create: if canEdit(request.resource.data.bizId) && request.resource.data.code is string && request.resource.data.code.size() > 0;
+      // The document number never changes. Removing and restoring need admin rights.
+      allow update: if canEdit(request.resource.data.bizId) && canEdit(resource.data.bizId)
+        && request.resource.data.code == resource.data.code
+        && (request.resource.data.get('deleted', false) == resource.data.get('deleted', false) || isBizAdmin(resource.data.bizId));
+      allow delete: if isSuper();
+    }
+    match /counters/{id} {
+      allow read: if approved();
+      allow create: if canFile() && request.resource.data.n == 1;
+      allow update: if canFile() && request.resource.data.n == resource.data.n + 1;
+    }
+    match /inbox/{id} {
+      allow read, write: if canFile();
+    }
+    match /routes/{id} {
+      allow read: if inBiz(resource.data.bizId);
+      allow create: if canEdit(request.resource.data.bizId) && request.resource.data.rev == 1;
+      // Every change raises rev by one, so two people cannot act on the same step at once.
+      allow update: if inBiz(resource.data.bizId) && request.resource.data.bizId == resource.data.bizId && request.resource.data.rev == resource.data.rev + 1;
+      allow delete: if isBizAdmin(resource.data.bizId);
+    }
+    match /audit/{id} {
+      allow read: if isSuper() || (isBizAdmin(resource.data.bizId) && resource.data.bizId != null);
+      allow create: if approved() && request.resource.data.userId == uid();
+      allow update, delete: if false;
+    }
+    match /notifications/{id} {
+      allow read: if signedIn() && resource.data.userId == uid();
+      allow create: if approved() && request.resource.data.fromId == uid();
+      allow update: if signedIn() && resource.data.userId == uid() && onlyChanges(['read']);
+      allow delete: if signedIn() && resource.data.userId == uid();
+    }
+    // File details (the file itself is in the company Google Drive). Readable by id only, never listed.
+    match /files/{id} {
+      allow get: if approved();
+      allow list: if isSuper();
+      allow create: if approved() && request.resource.data.uploadedBy == uid();
+      allow update: if approved() && onlyChanges(['chatOnly']) && request.resource.data.chatOnly == false;
+      allow delete: if isSuper();
+    }
+    // What a requester sees with document code + PIN (no sign-in). Only fetched by its exact id.
+    match /track/{id} {
+      allow get: if true;
+      allow list: if false;
+      allow write: if canEdit(request.resource.data.bizId);
+    }
+
+    /* ---------- chat ---------- */
+    function roomData(r) { return get(/databases/$(database)/documents/rooms/$(r)).data; }
+    match /rooms/{roomId} {
+      allow read: if (resource.data.kind == 'channel' && inBiz(resource.data.bizId)) || (signedIn() && uid() in resource.data.members);
+      allow create: if approved() && (
+        (request.resource.data.kind == 'channel' && isBizAdmin(request.resource.data.bizId))
+        || (request.resource.data.kind == 'group' && uid() in request.resource.data.members && request.resource.data.name.size() > 0)
+        || (request.resource.data.kind == 'dm' && uid() in request.resource.data.members && request.resource.data.members.size() == 2));
+      allow update: if approved() && request.resource.data.kind == resource.data.kind && (
+        (resource.data.kind == 'channel' && isBizAdmin(resource.data.bizId) && request.resource.data.bizId == resource.data.bizId)
+        || (resource.data.kind == 'group' && (resource.data.createdBy == uid() || isSuper()))
+        // members may add people or leave, nothing else
+        || (resource.data.kind == 'group' && uid() in resource.data.members && onlyChanges(['members'])
+            && resource.data.members.removeAll(request.resource.data.members).removeAll([uid()]).size() == 0)
+        || (resource.data.kind == 'dm' && uid() in resource.data.members && onlyChanges(['archived'])));
+      allow delete: if isSuper();
+    }
+    match /messages/{id} {
+      allow read: if (resource.data.kind == 'channel' && inBiz(resource.data.bizId)) || (signedIn() && uid() in resource.data.members);
+      allow create: if approved() && request.resource.data.by == uid() && (
+        (request.resource.data.kind == 'channel' && roomData(request.resource.data.roomId).kind == 'channel'
+          && request.resource.data.bizId == roomData(request.resource.data.roomId).bizId && inBiz(request.resource.data.bizId))
+        || (request.resource.data.kind == 'private' && uid() in roomData(request.resource.data.roomId).members
+          && request.resource.data.members == roomData(request.resource.data.roomId).members));
+      // Writers edit or remove their own; business admins may remove messages in channels.
+      allow update: if approved() && request.resource.data.roomId == resource.data.roomId && request.resource.data.by == resource.data.by
+        && request.resource.data.kind == resource.data.kind && request.resource.data.get('members', []) == resource.data.get('members', [])
+        && (resource.data.by == uid() || (resource.data.kind == 'channel' && isBizAdmin(resource.data.bizId) && request.resource.data.get('removed', false) == true));
+      allow delete: if isSuper();
+    }
+    match /announcements/{id} {
+      allow read: if approved() && (resource.data.bizId == null || inBiz(resource.data.bizId));
+      allow create: if (request.resource.data.bizId == null && isSuper()) || (request.resource.data.bizId != null && isBizAdmin(request.resource.data.bizId));
+      // Admins edit; everyone else may only add their own "I have read this".
+      allow update: if ((resource.data.bizId == null && isSuper()) || (resource.data.bizId != null && isBizAdmin(resource.data.bizId)))
+        || (approved() && (resource.data.bizId == null || inBiz(resource.data.bizId)) && onlyChanges(['acks'])
+            && request.resource.data.acks.diff(resource.data.acks).affectedKeys().hasOnly([uid()]));
+      allow delete: if (resource.data.bizId == null && isSuper()) || (resource.data.bizId != null && isBizAdmin(resource.data.bizId));
+    }
+  }
+}
